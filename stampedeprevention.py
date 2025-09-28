@@ -181,10 +181,10 @@ def compute_net_velocity(tracks, frame_idx):
     for track in tracks:
         if not hasattr(track, "track_id") or track.track_id is None:
             continue
-        if track.det_box is None:
+        if track.bbox is None:
             continue
         # Get current center
-        x1, y1, x2, y2 = track.det_box
+        x1, y1, x2, y2 = track.bbox
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
         tid = track.track_id
