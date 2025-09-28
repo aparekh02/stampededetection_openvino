@@ -38,32 +38,6 @@ def available_devices():
     devices = core.available_devices
     return {dev: dev for dev in devices}
 
-class VideoPlayer:
-    """Simple video player for webcam or file with optional flip."""
-    def __init__(self, source, size=(1920, 1080), fps=60, flip=True):
-        if isinstance(source, str) and source.isnumeric():
-            source = int(source)
-        self.cap = cv2.VideoCapture(source)
-        self.flip = flip
-        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if self.cap.isOpened() else size[0]
-        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if self.cap.isOpened() else size[1]
-        self.fps = fps
-
-    def start(self):
-        pass  # For compatibility
-
-    def next(self):
-        ret, frame = self.cap.read()
-        if not ret:
-            return None
-        if self.flip:
-            frame = cv2.flip(frame, 1)
-        return frame
-
-    def stop(self):
-        if self.cap.isOpened():
-            self.cap.release()
-
 def draw_text(frame, text, point=(10, 30), color=(0, 255, 0), scale=0.8, thickness=2, bg_color=(0,0,0)):
     """Draw text with background for readability."""
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -230,8 +204,20 @@ def draw_annotations(frame: np.array, detections: sv.Detections, tracker: DeepSo
                 safety_text += f" | Stampede Risk: {stampede_risk:.1f}%"
             draw_text(frame, text=safety_text, point=(10, 30 + zone_id * 30))
 
-def run(video_path: str, model_paths: Tuple[Path, Path], model_name: str = "", category: str = "person", zones_config_file: str = "",
-        object_limit: int = 3, room_capacity: int = 50, tracker_frames: int = 1800, flip: bool = True, colorful: bool = False, last_frames: int = 50) -> None:
+def run(
+    video_path: str,
+    model_paths: Tuple[Path, Path],
+    model_name: str = "",
+    category: str = "person",
+    zones_config_file: str = "",
+    object_limit: int = 3,
+    room_capacity: int = 50,
+    tracker_frames: int = 1800,
+    flip: bool = True,
+    colorful: bool = False,
+    last_frames: int = 50,
+    output_path: str = "output.mp4"
+) -> None:
     log.getLogger().setLevel(log.INFO)
     model_mapping = {
         "FP16": model_paths[0],
@@ -244,64 +230,79 @@ def run(video_path: str, model_paths: Tuple[Path, Path], model_name: str = "", c
     core.set_property({"CACHE_DIR": "cache"})
     model = get_model(model_mapping[model_type], device_type)
     input_shape = tuple(model.inputs[0].shape)[:0:-1]
-    if isinstance(video_path, str) and video_path.isnumeric():
-        video_path = int(video_path)
-    player = VideoPlayer(video_path, size=(1920, 1080), fps=60, flip=flip)
-    zones, zone_annotators, box_annotators, masks_annotators, label_annotators = get_annotators(json_path=zones_config_file, resolution_wh=(player.width, player.height), colorful=colorful)
+
+    # Open input video file
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Failed to open video: {video_path}")
+        return
+
+    # Get video properties
+    f_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    f_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # Prepare output video writer
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (f_width, f_height))
+
+    # Prepare annotators and tracker
+    zones, zone_annotators, box_annotators, masks_annotators, label_annotators = get_annotators(
+        json_path=zones_config_file, resolution_wh=(f_width, f_height), colorful=colorful
+    )
     category_id = CATEGORIES.index(category)
     queue_count = defaultdict(lambda: deque(maxlen=last_frames))
     processing_times = deque(maxlen=100)
     tracker = DeepSort(max_age=tracker_frames, n_init=3)
-    title = "Press ESC to Exit"
-    cv2.namedWindow(title, cv2.WINDOW_GUI_NORMAL)
-    cv2.setWindowProperty(title, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-    player.start()
+
+    frame_idx = 0
     while True:
-        frame = player.next()
-        if frame is None:
+        ret, frame = cap.read()
+        if not ret:
             print("Source ended")
             break
+        if flip:
+            frame = cv2.flip(frame, 1)
         frame = np.array(frame)
-        f_height, f_width = frame.shape[:2]
         input_image, padding = preprocess(image=frame, input_size=input_shape[:2])
         start_time = time.time()
         results = model(input_image)
         processing_times.append(time.time() - start_time)
         boxes = results[model.outputs[0]]
         masks = results[model.outputs[1]] if len(model.outputs) > 1 else None
-        detections = postprocess(pred_boxes=boxes, pred_masks=masks, input_size=input_shape[:2], orig_img=frame, padding=padding, category_id=category_id, min_conf_threshold=0.15, nms_iou_threshold=0.45)
-        draw_annotations(frame, detections, tracker, queue_count, object_limit, category, zones, zone_annotators, box_annotators, masks_annotators, label_annotators)
+        detections = postprocess(
+            pred_boxes=boxes,
+            pred_masks=masks,
+            input_size=input_shape[:2],
+            orig_img=frame,
+            padding=padding,
+            category_id=category_id,
+            min_conf_threshold=0.15,
+            nms_iou_threshold=0.45
+        )
+        draw_annotations(
+            frame, detections, tracker, queue_count, object_limit, category,
+            zones, zone_annotators, box_annotators, masks_annotators, label_annotators
+        )
         processing_time = np.mean(processing_times) * 1000
-        fps = 1000 / processing_time
-        draw_text(frame, text=f"Inference time: {processing_time:.0f}ms ({fps:.1f} FPS)", point=(f_width * 3 // 5, 10))
+        fps_calc = 1000 / processing_time if processing_time > 0 else 0
+        draw_text(frame, text=f"Inference time: {processing_time:.0f}ms ({fps_calc:.1f} FPS)", point=(f_width * 3 // 5, 10))
         draw_text(frame, text=f"Currently running {model_name} ({model_type}) on {device_type}", point=(f_width * 3 // 5, 50))
         draw_control_panel(frame, device_mapping)
         draw_ov_watermark(frame)
-        cv2.imshow(title, frame)
-        key = cv2.waitKey(1)
-        if key == 27 or key == ord('q'):
-            break
-        model_changed = False
-        if key == ord('f'):
-            model_type = "FP16"
-            model_changed = True
-        if key == ord('i'):
-            model_type = "INT8"
-            model_changed = True
-        for i, dev in enumerate(device_mapping.keys()):
-            if key == ord('1') + i:
-                device_type = dev
-                model_changed = True
-        if model_changed:
-            del model
-            model = get_model(model_mapping[model_type], device_type)
-            processing_times.clear()
-    player.stop()
-    cv2.destroyAllWindows()
+        out.write(frame)
+        frame_idx += 1
+        if frame_idx % 50 == 0 or frame_idx == 1:
+            print(f"Processed {frame_idx}/{total_frames} frames...")
+
+    cap.release()
+    out.release()
+    print(f"Annotated video saved to {output_path}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--stream', default="0", type=str, help="Path to a video file or the webcam number")
+    parser.add_argument('--stream', default="demo1.mp4", type=str, help="Path to a video file")
     parser.add_argument("--model_name", type=str, default="yolo11m", help="Model version to be converted",
                         choices=["yolov8n", "yolov8s", "yolov8m", "yolov8l", "yolov8x", "yolov8n-seg", "yolov8s-seg", "yolov8m-seg", "yolov8l-seg", "yolov8x-seg",
                                  "yolo11n", "yolo11s", "yolo11m", "yolo11l", "yolo11x", "yolo11n-seg", "yolo11s-seg", "yolo11m-seg", "yolo11l-seg", "yolo11x-seg"])
@@ -313,6 +314,19 @@ if __name__ == '__main__':
     parser.add_argument('--colorful', action="store_true", help="If objects should be annotated with random colors")
     parser.add_argument('--tracker_frames', type=int, default=1800, help="Maximum number of missed frames for the tracker")
     parser.add_argument('--room_capacity', type=int, default=50, help="Maximum safe capacity of the room")
+    parser.add_argument('--output', type=str, default="output.mp4", help="Path to save the annotated output video")
     args = parser.parse_args()
     model_paths = convert(args.model_name, Path(args.model_dir))
-    run(args.stream, model_paths, args.model_name, args.category, args.zones_config_file, args.object_limit, args.room_capacity, args.tracker_frames, args.flip, args.colorful)
+    run(
+        args.stream,
+        model_paths,
+        args.model_name,
+        args.category,
+        args.zones_config_file,
+        args.object_limit,
+        args.room_capacity,
+        args.tracker_frames,
+        args.flip,
+        args.colorful,
+        output_path=args.output
+    )
