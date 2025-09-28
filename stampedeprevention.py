@@ -164,12 +164,71 @@ def track_objects(frame: np.array, detections: sv.Detections, tracker: DeepSort)
     tracks = tracker.update_tracks(detection_list, frame=frame)
     return list(sorted(tracks, key=lambda x: x.det_conf if x.det_conf is not None else 0.0, reverse=True))
 
+# --- Velocity tracking state ---
+# For each track_id, store last center position
+track_last_centers = {}
+track_last_frame = {}
+
+def compute_net_velocity(tracks, frame_idx):
+    """
+    Compute net velocity (average dx, dy per frame) for all tracks with valid movement.
+    Returns: (avg_dx, avg_dy, direction_str)
+    """
+    global track_last_centers, track_last_frame
+    total_dx = 0.0
+    total_dy = 0.0
+    count = 0
+    for track in tracks:
+        if not hasattr(track, "track_id") or track.track_id is None:
+            continue
+        if track.det_box is None:
+            continue
+        # Get current center
+        x1, y1, x2, y2 = track.det_box
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        tid = track.track_id
+        if tid in track_last_centers and tid in track_last_frame:
+            last_cx, last_cy = track_last_centers[tid]
+            last_f = track_last_frame[tid]
+            dt = frame_idx - last_f
+            if dt > 0:
+                dx = (cx - last_cx) / dt
+                dy = (cy - last_cy) / dt
+                total_dx += dx
+                total_dy += dy
+                count += 1
+        # Update last center and frame
+        track_last_centers[tid] = (cx, cy)
+        track_last_frame[tid] = frame_idx
+    if count == 0:
+        return 0.0, 0.0, "none"
+    avg_dx = total_dx / count
+    avg_dy = total_dy / count
+    # Determine direction
+    dir_x = ""
+    dir_y = ""
+    if abs(avg_dx) > 1:
+        dir_x = "right" if avg_dx > 0 else "left"
+    if abs(avg_dy) > 1:
+        dir_y = "down" if avg_dy > 0 else "up"
+    if dir_x and dir_y:
+        direction = f"{dir_y}-{dir_x}"
+    elif dir_x:
+        direction = dir_x
+    elif dir_y:
+        direction = dir_y
+    else:
+        direction = "static"
+    return avg_dx, avg_dy, direction
+
 def draw_annotations(frame: np.array, detections: sv.Detections, tracker: DeepSort, queue_count: Dict, object_limit: int, category:str,
-                     zones: List, zone_annotators: List, box_annotators: List, masks_annotators: List, label_annotators: List) -> None:
+                     zones: List, zone_annotators: List, box_annotators: List, masks_annotators: List, label_annotators: List, frame_idx: int = 0) -> None:
 
     for zone_annotator in zone_annotators:
         frame = zone_annotator.annotate(scene=frame)
 
+    tracks = []
     if detections:
         tracks = track_objects(frame, detections, tracker)
         for zone_id, (zone, box_annotator, masks_annotator, label_annotator) in enumerate(
@@ -195,14 +254,21 @@ def draw_annotations(frame: np.array, detections: sv.Detections, tracker: DeepSo
                     stampede_risk = min(30 + ((excess_percentage - 20) * 1.5), 60)
                 else:
                     stampede_risk = min(60 + ((excess_percentage - 50) * 0.8), 85)
+            # Compute net velocity for all tracks
+            avg_dx, avg_dy, direction = compute_net_velocity(tracks, frame_idx)
+            # Print log with velocity
             log.info(f"{det_count}/{room_capacity} people "
-                     f"({occupancy_percentage:.1f}% occupied) - Status: {safety_status}")
+                     f"({occupancy_percentage:.1f}% occupied) - Status: {safety_status} | "
+                     f"Net velocity: ({avg_dx:.2f}, {avg_dy:.2f}) px/frame [{direction}]")
             if occupancy_percentage > 100:
                 log.warning(f"OVERCAPACITY! Stampede risk: {stampede_risk:.1f}%")
             safety_text = f"{det_count}/{room_capacity} people - {occupancy_percentage:.1f}% occupied ({safety_status})"
             if occupancy_percentage > 100:
                 safety_text += f" | Stampede Risk: {stampede_risk:.1f}%"
+            # Add velocity to overlay
+            velocity_text = f"Net velocity: ({avg_dx:.2f}, {avg_dy:.2f}) px/frame [{direction}]"
             draw_text(frame, text=safety_text, point=(10, 30 + zone_id * 30))
+            draw_text(frame, text=velocity_text, point=(10, 30 + zone_id * 30 + 22), color=(0, 200, 255))
 
 def run(
     video_path: str,
@@ -257,6 +323,10 @@ def run(
     tracker = DeepSort(max_age=tracker_frames, n_init=3)
 
     frame_idx = 0
+    window_name = "Stampede Prevention - Live"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, f_width, f_height)
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -283,7 +353,7 @@ def run(
         )
         draw_annotations(
             frame, detections, tracker, queue_count, object_limit, category,
-            zones, zone_annotators, box_annotators, masks_annotators, label_annotators
+            zones, zone_annotators, box_annotators, masks_annotators, label_annotators, frame_idx=frame_idx
         )
         processing_time = np.mean(processing_times) * 1000
         fps_calc = 1000 / processing_time if processing_time > 0 else 0
@@ -292,12 +362,22 @@ def run(
         draw_control_panel(frame, device_mapping)
         draw_ov_watermark(frame)
         out.write(frame)
+
+        # Show the video live
+        cv2.imshow(window_name, frame)
+        key = cv2.waitKey(1) & 0xFF
+        # Press 'q' to quit early
+        if key == ord('q'):
+            print("Quitting live display.")
+            break
+
         frame_idx += 1
         if frame_idx % 50 == 0 or frame_idx == 1:
             print(f"Processed {frame_idx}/{total_frames} frames...")
 
     cap.release()
     out.release()
+    cv2.destroyAllWindows()
     print(f"Annotated video saved to {output_path}")
 
 if __name__ == '__main__':
